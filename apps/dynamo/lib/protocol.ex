@@ -123,7 +123,7 @@ defmodule Dynamo do
     {:ok, nodes} = Ring.get_nodes_with_replicas(ring)
     {hashList, nodeList} = Enum.unzip(Node.expand(nodes))
     start_index = find_start_index(hashList, Hash.of(key))
-    circular_traversal(nodeList, start_index, state.replication_factor)
+    {circular_traversal(nodeList, start_index, state.replication_factor), start_index}
   end
 
   # Broadcast a message to all nodes in the configuration (excluding the sender.)
@@ -147,14 +147,14 @@ defmodule Dynamo do
 
         # IO.puts("Put request received at #{whoami()}")
         
-        preference_list = get_preference_list(state,key)
+        {preference_list, start_index} = get_preference_list(state,key)
         if not replication do 
           if(Enum.at(preference_list,0) == whoami()) do
             IO.inspect(preference_list)
             if context != nil do 
-              state = %{state | kv_store: Map.put(state.kv_store,key,{value, context})}
+              state = %{state | kv_store: Map.put(state.kv_store,key,{value, context},{whoami(), start_index})}
             end
-            state = %{state | kv_store: Dynamo.VectorClock.updateVectorClock(state.kv_store, key, value, whoami(), state.seq + 1)}   
+            state = %{state | kv_store: Dynamo.VectorClock.updateVectorClock(state.kv_store, key, value, whoami(), state.seq + 1, start_index)}   
             bcast(preference_list, %Dynamo.ServerPutRequest{
               key: key,
               value: value,
@@ -200,7 +200,7 @@ defmodule Dynamo do
         
         # IO.puts("Get request received at #{whoami()}")
         
-        preference_list = get_preference_list(state,key)
+        {preference_list, start_index} = get_preference_list(state,key)
         if not replication do 
           if(Enum.at(preference_list,0) == whoami()) do
             IO.inspect(preference_list)
@@ -223,7 +223,7 @@ defmodule Dynamo do
             server(state)
           end
         else
-          {value , vclock} = Map.get(state.kv_store, key)
+          # {value , vclock} = Map.get(state.kv_store, key)
           send(sender, %Dynamo.ServerGetResponse{
             key: key,
             value:  Map.get(state.kv_store, key),
@@ -383,8 +383,9 @@ defmodule Dynamo.Client do
         client(state)
 
       {sender, {key, responses}} ->
-        send(state.client, {:get, key, responses})
-        clockList = Enum.map(responses, fn {_first, second} -> second end)
+        clockList = Enum.map(responses, fn {_first, second, _third} -> second end)
+        clientResponse = Enum.map(responses, fn {first, second, _third} -> {first, second} end)
+        send(state.client, {:get, key, clientResponse})
         state = %{state | global_vector_clock: Map.put(state.global_vector_clock, key, clockList)}
         client(state)
     end
@@ -395,9 +396,9 @@ end
 
 defmodule Dynamo.VectorClock do
   
-  def updateVectorClock(store, key, value, node, counter) do
+  def updateVectorClock(store, key, value, node, counter, vnode) do
     case Map.get(store, key) do
-      {_, vclock} = {value, vclock} ->
+      {_, vclock, _} = {value, vclock, vnodeSig} ->
         if Map.has_key?(vclock, node) do
           oldCounter = Map.get(vclock, node)
           counter =
@@ -407,14 +408,14 @@ defmodule Dynamo.VectorClock do
               oldCounter
             end
           vclock = Map.put(vclock, node, counter)
-          Map.put(store, key, {value, vclock})
+          Map.put(store, key, {value, vclock, {node, vnode}})
         else
           vclock = Map.put(vclock, node, counter)
-          Map.put(store, key, {value, vclock})
+          Map.put(store, key, {value, vclock, {node, vnode}})
         end
       nil ->
         vclock = %{node => counter}
-        Map.put(store, key, {value, vclock})
+        Map.put(store, key, {value, vclock, {node, vnode}})
     end
   end
 
