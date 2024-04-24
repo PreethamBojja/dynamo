@@ -8,7 +8,8 @@ defmodule Dynamo.ClientPutRequest do
         key: nil,
         value: nil,
         server_list: nil,
-        seq: nil
+        seq: nil,
+        context: nil
     )
 
     @doc """
@@ -25,7 +26,8 @@ defmodule Dynamo.ClientPutRequest do
         key: key,
         value: value,
         server_list: server_list,
-        seq: seq
+        seq: seq,
+        context: nil
         }
     end
 end
@@ -39,7 +41,8 @@ defmodule Dynamo.ClientGetRequest do
     defstruct(
         key: nil,
         server_list: nil,
-        seq: nil
+        seq: nil,
+        context: nil
     )
 
     @doc """
@@ -54,7 +57,8 @@ defmodule Dynamo.ClientGetRequest do
         %ClientGetRequest{
         key: key,
         server_list: server_list,
-        seq: seq
+        seq: seq,
+        context: nil
         }
     end
 end
@@ -70,7 +74,8 @@ defmodule Dynamo.ServerPutRequest do
         value: nil,
         client: nil,
         replication: nil,
-        seq: nil
+        seq: nil,
+        context: nil
     )
 
     @doc """
@@ -88,7 +93,8 @@ defmodule Dynamo.ServerPutRequest do
         value: value,
         client: client,
         seq: seq,
-        replication: false
+        replication: false,
+        context: nil
         }
     end
 end
@@ -103,7 +109,8 @@ defmodule Dynamo.ServerGetRequest do
         key: nil,
         client: nil,
         replication: nil,
-        seq: nil
+        seq: nil,
+        context: nil
     )
 
     @doc """
@@ -119,7 +126,8 @@ defmodule Dynamo.ServerGetRequest do
         key: key,
         client: client,
         replication: false,
-        seq: seq
+        seq: seq,
+        context: nil
         }
     end
 end
@@ -134,7 +142,8 @@ defmodule Dynamo.ServerPutResponse do
         key: nil,
         client: nil,
         status: nil,
-        seq: nil
+        seq: nil,
+        context: nil
     )
 
     @doc """
@@ -152,7 +161,8 @@ defmodule Dynamo.ServerPutResponse do
         key: key,
         client: client,
         status: status,
-        seq: seq
+        seq: seq,
+        context: nil
         }
     end
 end
@@ -168,7 +178,8 @@ defmodule Dynamo.ServerGetResponse do
         value: nil,
         client: nil,
         status: nil,
-        seq: nil
+        seq: nil,
+        context: nil
     )
 
     @doc """
@@ -188,7 +199,8 @@ defmodule Dynamo.ServerGetResponse do
         value: value,
         client: client,
         status: status,
-        seq: seq
+        seq: seq,
+        context: nil
         }
     end
 end

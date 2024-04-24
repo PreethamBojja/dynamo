@@ -141,7 +141,8 @@ defmodule Dynamo do
         value: value,
         client: client,
         replication: replication,
-        seq: seq
+        seq: seq,
+        context: context
        }} ->
 
         # IO.puts("Put request received at #{whoami()}")
@@ -150,15 +151,19 @@ defmodule Dynamo do
         if not replication do 
           if(Enum.at(preference_list,0) == whoami()) do
             IO.inspect(preference_list)
-            state = %{state | kv_store: Map.put(state.kv_store, key, value)}
+            if context != nil do 
+              state = %{state | kv_store: Map.put(state.kv_store,key,{value, context})}
+            end
+            state = %{state | kv_store: Dynamo.VectorClock.updateVectorClock(state.kv_store, key, value, whoami(), state.seq + 1)}   
             bcast(preference_list, %Dynamo.ServerPutRequest{
               key: key,
               value: value,
               client: client,
               replication: true,
-              seq: state.seq + 1
+              seq: state.seq + 1,
+              context: Map.get(state.kv_store,key)
              })
-            #  IO.puts("Got into co-ordinator and started broadcast")
+            # IO.puts("Got into co-ordinator and started broadcast")
             server(%{ state | seq: state.seq + 1})
           else
             send(Enum.at(preference_list,0), %Dynamo.ServerPutRequest{
@@ -166,20 +171,22 @@ defmodule Dynamo do
               value: value,
               client: client,
               replication: false,
-              seq: nil
+              seq: nil,
+              context: context
              })  
             server(state)
           end
         else
           # IO.puts("Got into replication at #{whoami()}")
-          state = %{state | kv_store: Map.put(state.kv_store, key, value)} 
+          # LAST WRITE WINS
+          state = %{state | kv_store: Map.put(state.kv_store, key, context)}
           send(sender, %Dynamo.ServerPutResponse{
             key: key,
             status: :ok,
             client: client,
             seq: seq
             }) 
-            server(%{ state | seq: seq})
+          server(%{state | seq: seq})
         end
       
       {sender,
@@ -187,7 +194,8 @@ defmodule Dynamo do
          key: key,
          client: client,
          replication: replication,
-         seq: seq
+         seq: seq,
+         context: context
        }} ->
         
         # IO.puts("Get request received at #{whoami()}")
@@ -215,10 +223,10 @@ defmodule Dynamo do
             server(state)
           end
         else
-          value = Map.get(state.kv_store, key)
+          {value , vclock} = Map.get(state.kv_store, key)
           send(sender, %Dynamo.ServerGetResponse{
             key: key,
-            value: value,
+            value:  Map.get(state.kv_store, key),
             status: :ok,
             client: client,
             seq: seq
@@ -231,7 +239,8 @@ defmodule Dynamo do
           key: key,
           status: status,
           client: client,
-          seq: seq
+          seq: seq,
+          context: context
         }} ->
           # IO.puts("Got into server put response at #{whoami()}")  
           if status == :ok do
@@ -247,33 +256,39 @@ defmodule Dynamo do
             server(state)  
           end
 
-          {sender,
-          %Dynamo.ServerGetResponse{
-            key: key,
-            value: value,
-            status: status,
-            client: client,
-            seq: seq
-          }} ->
-            # IO.puts("Got into server get response at #{whoami()}")  
-            if status == :ok do
-              responses = Map.get(state.responses, seq, []) ++ [value]
-              state = %{state | responses: Map.put(state.responses, seq, responses)}
-              state = if Map.get(state.response_count, seq, nil) == nil do
-                        %{state | response_count: Map.put(state.response_count, seq, 1)}
-                      else
-                        count = Map.get(state.response_count, seq)
-                        %{state | response_count: Map.put(state.response_count, seq, count + 1)} 
-                      end 
-              if Map.get(state.response_count, seq, nil) == state.read_quorum - 1 do
-                send(client, {key, Map.get(state.responses, seq)})
-              end
-              server(state)  
+      {sender,
+        %Dynamo.ServerGetResponse{
+          key: key,
+          value: value,
+          status: status,
+          client: client,
+          seq: seq,
+          context: context
+        }} ->
+        # IO.puts("Got into server get response at #{whoami()}")  
+        if status == :ok do
+          responses = Map.get(state.responses, seq, []) ++ [value]
+          state = %{state | responses: Map.put(state.responses, seq, responses)}
+          state = if Map.get(state.response_count, seq, nil) == nil do
+                    %{state | response_count: Map.put(state.response_count, seq, 1)}
+                  else
+                    count = Map.get(state.response_count, seq)
+                    %{state | response_count: Map.put(state.response_count, seq, count + 1)} 
+                  end 
+          
+          state = 
+            if Map.get(state.response_count, seq, nil) == state.read_quorum - 1 do
+              reconciledResponses = Dynamo.VectorClock.syntaticReconcilationWithValues(Map.get(state.responses, seq))
+              state = %{state | responses: Map.put(state.responses, seq, reconciledResponses)}
+              send(client, {key, Map.get(state.responses, seq)})
+              state
             end
+          server(state)  
+        end
 
-       {sender, :state} ->
-        send(sender,{whoami(), state})
-        server(state) 
+      {sender, :state} ->
+          send(sender,{whoami(), state})
+          server(state) 
     end     
   end
 end
@@ -294,7 +309,9 @@ defmodule Dynamo.Client do
   @enforce_keys [:client_list]
   defstruct(
     client_list: nil,
-    client: nil
+    client: nil,
+    # Used to store last get operations vector clock to send back as context
+    global_vector_clock: nil
   )
 
   @doc """
@@ -302,7 +319,8 @@ defmodule Dynamo.Client do
   """
   @spec new_client_configuration(list()) :: %Client{client_list: list()}
   def new_client_configuration(client_list) do
-    %Client{client_list: client_list}
+    %Client{client_list: client_list,
+            global_vector_clock: %{}}
   end
 
   # 
@@ -327,12 +345,20 @@ defmodule Dynamo.Client do
 
         server = Enum.random(server_list)
         IO.puts("Sent to server #{server} from #{whoami()}")
+        context = 
+          if Map.get(state.global_vector_clock, key, nil) != nil do
+            Dynamo.VectorClock.clientReconcilation(Map.get(state.global_vector_clock,key))
+          else
+            nil
+          end
+        
         send(server, %Dynamo.ServerPutRequest{
           key: key,
           value: value,
           client: whoami(),
           replication: false,
-          seq: nil
+          seq: nil,
+          context: nil
         })
         client(%{state | client: sender})
 
@@ -358,7 +384,167 @@ defmodule Dynamo.Client do
 
       {sender, {key, responses}} ->
         send(state.client, {:get, key, responses})
+        clockList = Enum.map(responses, fn {_first, second} -> second end)
+        state = %{state | global_vector_clock: Map.put(state.global_vector_clock, key, clockList)}
         client(state)
     end
   end
+end
+
+#----------------------------------------------------------------------------------------------------------
+
+defmodule Dynamo.VectorClock do
+  
+  def updateVectorClock(store, key, value, node, counter) do
+    case Map.get(store, key) do
+      {_, vclock} = {value, vclock} ->
+        if Map.has_key?(vclock, node) do
+          oldCounter = Map.get(vclock, node)
+          counter =
+            if counter > oldCounter do
+              counter
+            else
+              oldCounter
+            end
+          vclock = Map.put(vclock, node, counter)
+          Map.put(store, key, {value, vclock})
+        else
+          vclock = Map.put(vclock, node, counter)
+          Map.put(store, key, {value, vclock})
+        end
+      nil ->
+        vclock = %{node => counter}
+        Map.put(store, key, {value, vclock})
+    end
+  end
+
+  def equalTo(clock1, clock2) do
+      Map.equal?(clock1, clock2)
+  end
+
+  def notEqualTo(clock1, clock2) do
+      not equalTo(clock1, clock2)
+  end
+
+  def lessThan(clock1, clock2) do
+      if Enum.sort(Map.keys(clock1)) == Enum.sort(Map.keys(clock2)) do
+          merged_clock = Map.merge(clock1, clock2, fn _k, c1, c2 -> c1 < c2 end)
+          compare_results = Map.values(merged_clock)
+          Enum.all?(compare_results, fn x -> x == true end)
+      else
+          false
+      end
+  end
+
+  def lessThanEqualTo(clock1, clock2) do
+    lessThan(clock1, clock2) or equalTo(clock1, clock2)
+  end
+
+  def greaterThan(clock1, clock2) do
+    lessThan(clock2, clock1)
+  end
+
+  def greaterThanEqualTo(clock1, clock2) do
+    greaterThan(clock1, clock2) or equalTo(clock1, clock2)
+  end
+
+  #-----------------------------------------------------------------------
+
+  def syntaticReconcilationMerger(currIndex, clock, result) do
+    if currIndex == length(result) do
+      {result, false}
+    else
+      cond do
+        lessThanEqualTo(clock, Enum.at(result, currIndex)) ->
+          {result, true}
+
+          lessThan(Enum.at(result, currIndex), clock) ->
+          result = List.update_at(result, currIndex, fn _ -> clock end)
+          {result, true}
+
+        true ->
+          syntaticReconcilationMerger(currIndex + 1, clock, result)
+      end
+    end
+  end
+
+  defp syntaticReconcilationHelper(currIndex, clockList, result) do
+    if currIndex == length(clockList) do
+      result
+    else
+      {result, succ} = syntaticReconcilationMerger(0, Enum.at(clockList, currIndex), result)
+
+      result =
+        if succ do
+          result
+        else
+          result ++ [Enum.at(clockList, currIndex)]
+        end
+
+      syntaticReconcilationHelper(currIndex + 1, clockList, result)
+    end
+  end
+
+  def syntaticReconcilation(clockList) do
+    syntaticReconcilationHelper(0, clockList, [])
+  end
+
+  #----------------------------------------------------------------------------------------------
+
+  def syntaticReconcilationMergerWithValues(currIndex, clock, result) do
+    if currIndex == length(result) do
+      {result, false}
+    else
+      cond do
+        lessThanEqualTo(elem(clock, 1), elem(Enum.at(result, currIndex), 1)) ->
+          {result, true}
+
+        lessThan(elem(Enum.at(result, currIndex), 1), elem(clock, 1)) ->
+          result = List.update_at(result, currIndex, fn _ -> clock end)
+          {result, true}
+
+        true ->
+          syntaticReconcilationMergerWithValues(currIndex + 1, clock, result)
+      end
+    end
+  end
+
+  defp syntaticReconcilationWithValuesHelper(currIndex, divergedValues, result) do
+    if currIndex == length(divergedValues) do
+      result
+    else
+      {result, succ} =
+        syntaticReconcilationMergerWithValues(0, Enum.at(divergedValues, currIndex), result)
+
+      result =
+        if succ do
+          result
+        else
+          result ++ [Enum.at(divergedValues, currIndex)]
+        end
+
+        syntaticReconcilationWithValuesHelper(currIndex + 1, divergedValues, result)
+    end
+  end
+
+  def syntaticReconcilationWithValues(divergedValues) do
+    syntaticReconcilationWithValuesHelper(0, divergedValues, [])
+  end
+
+  #------------------------------------------------------------------------------------------------------
+
+  #Client reconcilation
+  defp clientReconcilationHelper([], result) do
+    result
+  end 
+
+  defp clientReconcilationHelper([clock | rest], result) do
+    reconciledClock = Map.merge(clock, result, fn _k, c1, c2 -> max(c1, c2) end)
+    clientReconcilationHelper(rest, reconciledClock)
+  end
+  
+  def clientReconcilation(divergedClocks) do
+    clientReconcilationHelper(divergedClocks, %{})
+  end
+  
 end
