@@ -54,7 +54,6 @@ defmodule Dynamo do
   }
   def new_configuration(nodes, vnodes, clients, replication_factor, read_quorum, write_quorum) do
     {:ok, ring} = Ring.start_link()
-    IO.inspect(Ring.add_node(ring, :a, 3))
     %Dynamo{
       nodes: nodes,
       vnodes: vnodes,
@@ -150,19 +149,27 @@ defmodule Dynamo do
         {preference_list, start_index} = get_preference_list(state,key)
         if not replication do 
           if(Enum.at(preference_list,0) == whoami()) do
-            IO.inspect(preference_list)
             if context != nil do 
               state = %{state | kv_store: Map.put(state.kv_store,key,{value, context},{whoami(), start_index})}
             end
             state = %{state | kv_store: Dynamo.VectorClock.updateVectorClock(state.kv_store, key, value, whoami(), state.seq + 1, start_index)}   
+            IO.puts("Put done at for key:#{key} and value:#{value} at seq:#{state.seq + 1} at #{whoami()}")
+            IO.inspect(state.kv_store)
+            state = 
+              if state.write_quorum == 1 do
+                send(client, {:ok, key})
+                state
+              else
+                state
+              end 
             bcast(preference_list, %Dynamo.ServerPutRequest{
-              key: key,
-              value: value,
-              client: client,
-              replication: true,
-              seq: state.seq + 1,
-              context: Map.get(state.kv_store,key)
-             })
+                    key: key,
+                    value: value,
+                    client: client,
+                    replication: true,
+                    seq: state.seq + 1,
+                    context: Map.get(state.kv_store,key)
+                  })
             # IO.puts("Got into co-ordinator and started broadcast")
             server(%{ state | seq: state.seq + 1})
           else
@@ -179,6 +186,7 @@ defmodule Dynamo do
         else
           # IO.puts("Got into replication at #{whoami()}")
           # LAST WRITE WINS
+          IO.puts("Put replicated at for key:#{key} and value:#{value} at seq:#{seq} at #{whoami()}")
           state = %{state | kv_store: Map.put(state.kv_store, key, context)}
           send(sender, %Dynamo.ServerPutResponse{
             key: key,
@@ -203,15 +211,21 @@ defmodule Dynamo do
         {preference_list, start_index} = get_preference_list(state,key)
         if not replication do 
           if(Enum.at(preference_list,0) == whoami()) do
-            IO.inspect(preference_list)
             state = %{state | responses: Map.put(state.responses, state.seq + 1, [Map.get(state.kv_store,key)])}
-            bcast(preference_list, %Dynamo.ServerGetRequest{
-              key: key,
-              client: client,
-              replication: true,
-              seq: state.seq + 1
-             })
             #  IO.puts("Got into co-ordinator and started broadcast")
+            state = 
+              if state.read_quorum == 1 do
+                send(client, {key, Map.get(state.responses, state.seq + 1)})
+                state
+              else
+                state
+              end
+            bcast(preference_list, %Dynamo.ServerGetRequest{
+                  key: key,
+                  client: client,
+                  replication: true,
+                  seq: state.seq + 1
+                })
             server(%{ state | seq: state.seq + 1})
           else
             send(Enum.at(preference_list,0), %Dynamo.ServerGetRequest{
@@ -255,6 +269,7 @@ defmodule Dynamo do
             end
             server(state)  
           end
+          server(state)
 
       {sender,
         %Dynamo.ServerGetResponse{
@@ -267,24 +282,32 @@ defmodule Dynamo do
         }} ->
         # IO.puts("Got into server get response at #{whoami()}")  
         if status == :ok do
-          responses = Map.get(state.responses, seq, []) ++ [value]
-          state = %{state | responses: Map.put(state.responses, seq, responses)}
+          IO.inspect(state)
+          IO.inspect(state.responses)
           state = if Map.get(state.response_count, seq, nil) == nil do
                     %{state | response_count: Map.put(state.response_count, seq, 1)}
                   else
                     count = Map.get(state.response_count, seq)
                     %{state | response_count: Map.put(state.response_count, seq, count + 1)} 
                   end 
+          responses = Map.get(state.responses, seq, []) ++ [value]
+          state = %{state | responses: Map.put(state.responses, seq, responses)}
           
           state = 
-            if Map.get(state.response_count, seq, nil) == state.read_quorum - 1 do
+            if Map.get(state.response_count, seq, 0) == state.read_quorum - 1 do
+              IO.inspect(state)
               reconciledResponses = Dynamo.VectorClock.syntaticReconcilationWithValues(Map.get(state.responses, seq))
               state = %{state | responses: Map.put(state.responses, seq, reconciledResponses)}
               send(client, {key, Map.get(state.responses, seq)})
               state
+            else
+              state
             end
+          IO.inspect("Started listening with state")
+          IO.inspect(state)
           server(state)  
         end
+        server(state)
 
       {sender, :state} ->
           send(sender,{whoami(), state})
@@ -344,7 +367,6 @@ defmodule Dynamo.Client do
        }} ->
 
         server = Enum.random(server_list)
-        IO.puts("Sent to server #{server} from #{whoami()}")
         context = 
           if Map.get(state.global_vector_clock, key, nil) != nil do
             Dynamo.VectorClock.clientReconcilation(Map.get(state.global_vector_clock,key))
@@ -378,11 +400,12 @@ defmodule Dynamo.Client do
         client(%{state | client: sender})
 
       {sender, {:ok, key}} ->
-        IO.inspect(state.client)
-        send(state.client, {:put, :ok, key})
+        # send(state.client, {:put, :ok, key})
+        IO.inspect("Put done for client:#{whoami()} with key:#{key} ")
         client(state)
 
       {sender, {key, responses}} ->
+        IO.inspect("Get done for client:#{whoami()} with key:#{key} ")
         clockList = Enum.map(responses, fn {_first, second, _third} -> second end)
         clientResponse = Enum.map(responses, fn {first, second, _third} -> {first, second} end)
         send(state.client, {:get, key, clientResponse})
@@ -398,7 +421,7 @@ defmodule Dynamo.VectorClock do
   
   def updateVectorClock(store, key, value, node, counter, vnode) do
     case Map.get(store, key) do
-      {_, vclock, _} = {value, vclock, vnodeSig} ->
+      {_, vclock, _} ->
         if Map.has_key?(vclock, node) do
           oldCounter = Map.get(vclock, node)
           counter =

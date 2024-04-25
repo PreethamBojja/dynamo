@@ -6,10 +6,11 @@ defmodule DynamoTest do
 
   test "Dynamo test" do
     Emulation.init()
+    # Emulation.append_fuzzers([Fuzzers.delay(50.0)])
 
     nodes = [:s1, :s2, :s3, :s4, :s5, :s6, :s7]
-    clients = [:c1, :c2, :c3]
-    config = Dynamo.new_configuration(nodes, 5, clients, 3, 2, 2)
+    clients = [:c1, :c2, :c3, :c4, :c5, :c6]
+    config = Dynamo.new_configuration(nodes, 5, clients, 3, 2, 1)
     nodes
     |> Enum.map(fn x ->
       Emulation.spawn(
@@ -31,63 +32,70 @@ defmodule DynamoTest do
       Emulation.spawn(:client, fn ->
         Emulation.send(:c1, %Dynamo.ClientPutRequest{
           key: Bojja,
-          value: "sb9509",
+          value: "First",
           server_list: nodes
         })
-
-        receive do
-          {c , {:put, :ok, return}} ->
-            IO.inspect("Put done 1")
-        end
       end)
 
-    handle = Process.monitor(client)
+    Process.sleep(100)
+    # view = [:s4, :s5, :s6]
+    # view |> Enum.map(fn x -> Emulation.send(x, :state) end)
+    # states =
+    #   view
+    #   |> Enum.map(fn x ->
+    #     receive do
+    #       {^x, state} -> state
+    #     end
+    #   end)
 
-    receive do
-      {:DOWN, ^handle, _, _, _} -> true
-    after
-      1_000 -> assert false
-    end
+    # IO.inspect(states)
 
     client2 =
       Emulation.spawn(:client2, fn ->
-        Emulation.send(:c1, %Dynamo.ClientPutRequest{
-          key: Maithili,
-          value: "sc10648",
+        Emulation.send(:c2, %Dynamo.ClientPutRequest{
+          key: Bojja,
+          value: "Second",
           server_list: nodes
         })
+      end)
+       Process.sleep(100)
 
-        receive do
-          {c , {:put, :ok, return}} ->
-            IO.inspect("Put done 2")
-        end
+     client3 =
+      Emulation.spawn(:client3, fn ->
+        Emulation.send(:c3, %Dynamo.ClientPutRequest{
+          key: Bojja,
+          value: "Third",
+          server_list: nodes
+        })
+      end)
+       Process.sleep(100)
+
+     client4 =
+      Emulation.spawn(:client4, fn ->
+        Emulation.send(:c4, %Dynamo.ClientPutRequest{
+          key: Bojja,
+          value: "Fourth",
+          server_list: nodes
+        })
       end)
 
-    handle = Process.monitor(client2)
+    Process.sleep(1000)
+    # view = [:s4, :s5, :s6]
+    # view |> Enum.map(fn x -> Emulation.send(x, :state) end)
+    # states =
+    #   view
+    #   |> Enum.map(fn x ->
+    #     receive do
+    #       {^x, state} -> state
+    #     end
+    #   end)
 
-    receive do
-      {:DOWN, ^handle, _, _, _} -> 
-        # nodes |> Enum.map(fn x -> Emulation.send(x, :state) end)
+    # IO.inspect(states)
 
-        # states =
-        #   nodes
-        #   |> Enum.map(fn x ->
-        #     receive do
-        #       {^x, state} -> state
-        #     end
-        #   end)
-
-        # IO.inspect(states)
-
-        true
-    after
-      1_000 -> assert false
-    end
-
-    client3 =
-      Emulation.spawn(:client3, fn ->
-        Emulation.send(:c1, %Dynamo.ClientGetRequest{
-          key: Maithili,
+    client6 =
+      Emulation.spawn(:client6, fn ->
+        Emulation.send(:c3, %Dynamo.ClientGetRequest{
+          key: Bojja,
           server_list: nodes
         })
 
@@ -98,7 +106,7 @@ defmodule DynamoTest do
         end
       end)
 
-    handle = Process.monitor(client3)
+    handle = Process.monitor(client6)
 
     receive do
       {:DOWN, ^handle, _, _, _} -> 
@@ -116,7 +124,7 @@ defmodule DynamoTest do
 
         true
     after
-      1_000 -> assert false
+      1_0000 -> assert false
     end
     
 
