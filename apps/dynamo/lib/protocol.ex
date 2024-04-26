@@ -40,7 +40,9 @@ defmodule Dynamo do
     # Map from seq number to responses list
     responses: nil,
     # Map from each vnode to keys stored 
-    vnodeToKeys: nil
+    vnodeToKeys: nil,
+    # Map from each server to all nodes status
+    status_of_nodes: nil
   )
 
   # 
@@ -80,6 +82,7 @@ defmodule Dynamo do
   def make_server(state) do
     Ring.add_node(state.ring, whoami(), state.vnodes)
     timer = Emulation.timer(50, :antientropy)
+    timer = Emulation.timer(200, :gossip)
     server(%{state | node: whoami()})
   end
 
@@ -180,6 +183,22 @@ defmodule Dynamo do
             end
         end
       end)
+    end)
+  end
+
+  # Implementing Gossip Protocol
+  def gossipExchange(sender, receiver, sender_nodes_status, receiver_nodes_status) do
+    Enum.reduce(sender_nodes_status, receiver_nodes_status, fn {node, {sender_node_status, sender_node_timestamp}}, acc_nodes_status ->
+      case Map.get(acc_nodes_status, node) do
+        nil ->
+          acc_nodes_status = Map.put(acc_nodes_status, node, {sender_node_status, sender_node_timestamp})
+        {receiver_node_status, receiver_node_timestamp} ->
+          if sender_node_timestamp > receiver_node_timestamp do
+            acc_nodes_status = Map.put(acc_nodes_status, node, {sender_node_status, sender_node_timestamp})
+          else
+            acc_nodes_status
+          end
+      end
     end)
   end
 
@@ -397,11 +416,29 @@ defmodule Dynamo do
           timer = Emulation.timer(50, :antientropy)
           server(state)
 
+
       {sender, {:merkle_request, sender_kv_store}} ->
           receiver_kv_store = state.kv_store
           updated_kv_store = syncronisation(sender, whoami(), sender_kv_store, receiver_kv_store)
           server(%{state | kv_store: updated_kv_store})
         
+      :gossip ->
+        other_nodes = List.delete(state.nodes, whoami())
+        select_node = Enum.random(other_nodes)
+        send(select_node, {:gossip_request, state.status_of_nodes})
+        timer = Emulation.timer(200, :gossip)
+
+      {sender, {:gossip_request, sender_nodes_status}} ->
+        receiver_nodes_status = state.status_of_nodes
+        updated_status_of_nodes = gossipExchange(sender, whoami(), sender_nodes_status, receiver_nodes_status)
+        send(sender, {:gossip_response, updated_status_of_nodes})
+        server(%{state | status_of_nodes: updated_status_of_nodes})
+      
+      {sender, {:gossip_request, sender_nodes_status}} ->
+        receiver_nodes_status = state.status_of_nodes
+        updated_status_of_nodes = gossipExchange(sender, whoami(), sender_nodes_status, receiver_nodes_status)
+        server(%{state | status_of_nodes: updated_status_of_nodes})
+
       {sender, :state} ->
           send(sender,{whoami(), state})
           server(state) 
