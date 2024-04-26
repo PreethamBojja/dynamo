@@ -75,7 +75,8 @@ defmodule Dynamo.ServerPutRequest do
         client: nil,
         replication: nil,
         seq: nil,
-        context: nil
+        context: nil,
+        vnodeIndex: nil
     )
 
     @doc """
@@ -94,7 +95,8 @@ defmodule Dynamo.ServerPutRequest do
         client: client,
         seq: seq,
         replication: false,
-        context: nil
+        context: nil,
+        vnodeIndex: nil
         }
     end
 end
@@ -143,7 +145,8 @@ defmodule Dynamo.ServerPutResponse do
         client: nil,
         status: nil,
         seq: nil,
-        context: nil
+        context: nil,
+        vnodeIndex: nil
     )
 
     @doc """
@@ -162,7 +165,8 @@ defmodule Dynamo.ServerPutResponse do
         client: client,
         status: status,
         seq: seq,
-        context: nil
+        context: nil,
+        vnodeIndex: nil
         }
     end
 end

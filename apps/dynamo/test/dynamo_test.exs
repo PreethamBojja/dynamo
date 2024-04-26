@@ -53,7 +53,7 @@ defmodule DynamoTest do
     client2 =
       Emulation.spawn(:client2, fn ->
         Emulation.send(:c2, %Dynamo.ClientPutRequest{
-          key: Bojja,
+          key: Sai,
           value: "Second",
           server_list: nodes
         })
@@ -63,7 +63,7 @@ defmodule DynamoTest do
      client3 =
       Emulation.spawn(:client3, fn ->
         Emulation.send(:c3, %Dynamo.ClientPutRequest{
-          key: Bojja,
+          key: Preetham,
           value: "Third",
           server_list: nodes
         })
@@ -73,7 +73,7 @@ defmodule DynamoTest do
      client4 =
       Emulation.spawn(:client4, fn ->
         Emulation.send(:c4, %Dynamo.ClientPutRequest{
-          key: Bojja,
+          key: Reddy,
           value: "Fourth",
           server_list: nodes
         })
@@ -110,17 +110,17 @@ defmodule DynamoTest do
 
     receive do
       {:DOWN, ^handle, _, _, _} -> 
-        # nodes |> Enum.map(fn x -> Emulation.send(x, :state) end)
+        nodes |> Enum.map(fn x -> Emulation.send(x, :state) end)
 
-        # states =
-        #   nodes
-        #   |> Enum.map(fn x ->
-        #     receive do
-        #       {^x, state} -> state
-        #     end
-        #   end)
+        states =
+          nodes
+          |> Enum.map(fn x ->
+            receive do
+              {^x, state} -> state
+            end
+          end)
 
-        # IO.inspect(states)
+        IO.inspect(states)
 
         true
     after
