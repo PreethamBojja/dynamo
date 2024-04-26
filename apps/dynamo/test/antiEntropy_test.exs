@@ -22,7 +22,13 @@ defmodule AntiEntropyTest do
         }
 
         updated_receiver_kv_store = Dynamo.syncronisation("sender", "receiver", sender_kv_store, receiver_kv_store)
+        
         IO.inspect(updated_receiver_kv_store)
+        # Assertions to validate correct synchronization
+        assert updated_receiver_kv_store["item1"] == {"data1", %{"a" => 2}, {"sender", 3}, 1, 1}, "item1 should be updated with newer data from sender"
+        assert updated_receiver_kv_store["item2"] == {"?_data2", %{"b" => 1}, {"sender", 3}, 1, 3}, "item2 should remain unchanged as it is not outdated"
+        assert updated_receiver_kv_store["item3"] == {"data3", %{"a" => 4}, {"sender", 3}, 1, 4}, "item3 should be added to receiver with correct data"
+        assert updated_receiver_kv_store["r1"] == {"x1", %{"b" => 1}, {"receiver", 1}, 1, 1}, "r1 should remain unchanged as it's receiver's own data"
 
     after
         Emulation.terminate()
