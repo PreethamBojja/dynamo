@@ -358,8 +358,29 @@ defmodule Dynamo do
           
           state = 
             if Map.get(state.response_count, seq, 0) == state.read_quorum - 1 do
-              reconciledResponses = Dynamo.VectorClock.syntaticReconcilationWithValues(Map.get(state.responses, seq))
-              state = %{state | responses: Map.put(state.responses, seq, reconciledResponses)}
+              syntaticallyReconciledResponses = Dynamo.VectorClock.syntaticReconcilationWithValues(Map.get(state.responses, seq))
+              {finalResponse, finalClock} = 
+                  if length(syntaticallyReconciledResponses) == 1 do
+                    # {elem(Enum.at(syntaticallyReconciledResponses,0), 0),elem(Enum.at(syntaticallyReconciledResponses,0), 1)} 
+                    clockList = Enum.map(syntaticallyReconciledResponses, fn {_first, second, _third, _fourth, _fifth} -> second end)
+                    {latestResponse, _, _, _, latestTimeStamp} = Enum.max_by(syntaticallyReconciledResponses, fn {_, _, _, _, fifth} -> fifth end)
+                    mergedClock = Dynamo.VectorClock.clientReconcilation(clockList)
+                    {latestResponse, mergedClock}     
+                  else
+                    clockList = Enum.map(syntaticallyReconciledResponses, fn {_first, second, _third, _fourth, _fifth} -> second end)
+                    {latestResponse, _, _, _, latestTimeStamp} = Enum.max_by(syntaticallyReconciledResponses, fn {_, _, _, _, fifth} -> fifth end)
+                    mergedClock = Dynamo.VectorClock.clientReconcilation(clockList)
+                    send(whoami(), %Dynamo.ServerPutRequest{
+                                key: key,
+                                value: latestResponse,
+                                client: client,
+                                replication: false,
+                                seq: nil,
+                                context: mergedClock
+                              })
+                    {latestResponse, mergedClock}
+                  end
+              state = %{state | responses: Map.put(state.responses, seq, [{finalResponse, finalClock}])}
               send(client, {key, Map.get(state.responses, seq)})
               state
             else
@@ -375,12 +396,12 @@ defmodule Dynamo do
           send(select_node, {:merkle_request, state.kv_store})
           timer = Emulation.timer(50, :antientropy)
           server(state)
+
       {sender, {:merkle_request, sender_kv_store}} ->
           receiver_kv_store = state.kv_store
           updated_kv_store = syncronisation(sender, whoami(), sender_kv_store, receiver_kv_store)
           server(%{state | kv_store: updated_kv_store})
         
-
       {sender, :state} ->
           send(sender,{whoami(), state})
           server(state) 
@@ -439,12 +460,7 @@ defmodule Dynamo.Client do
        }} ->
 
         server = Enum.random(server_list)
-        context = 
-          if Map.get(state.global_vector_clock, key, nil) != nil do
-            Dynamo.VectorClock.clientReconcilation(Map.get(state.global_vector_clock,key))
-          else
-            nil
-          end
+        context = Map.get(state.global_vector_clock, key, nil)
         
         send(server, %Dynamo.ServerPutRequest{
           key: key,
@@ -478,10 +494,8 @@ defmodule Dynamo.Client do
 
       {sender, {key, responses}} ->
         IO.inspect("Get done for client:#{whoami()} with key:#{key} ")
-        clockList = Enum.map(responses, fn {_first, second, _third, _fourth, _fifth} -> second end)
-        clientResponse = Enum.map(responses, fn {first, second, _third, _fourth, _fifth} -> {first, second} end)
-        send(state.client, {:get, key, clientResponse})
-        state = %{state | global_vector_clock: Map.put(state.global_vector_clock, key, clockList)}
+        send(state.client, {:get, key, elem(Enum.at(responses,0),0)})
+        state = %{state | global_vector_clock: Map.put(state.global_vector_clock, key, elem(Enum.at(responses,0),1))}
         client(state)
     end
   end
