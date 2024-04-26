@@ -77,6 +77,7 @@ defmodule Dynamo do
   @spec make_server(%Dynamo{}) :: no_return()
   def make_server(state) do
     Ring.add_node(state.ring, whoami(), state.vnodes)
+    timer = Emulation.timer(50, :antientropy)
     server(%{state | node: whoami()})
   end
 
@@ -131,6 +132,53 @@ defmodule Dynamo do
   defp bcast(node_list, msg) do
     node_list
     |> Enum.map(fn node -> if node != whoami() do send(node, msg) end end)
+  end
+
+  # AntiEntropy syncronisation, same intution as Merkle tress, can be optimised through Merkle Tree comparision
+  def syncronisation(sender, receiver, sender_kv_store, receiver_kv_store) do
+    # Collecting all {sender_vnode, receiver_vnode} where server_node matches sender_node
+    sender_receiver_vnode_pairs = receiver_kv_store
+    |> Enum.map(fn {_, {_, _, {server, sender_vnode}, receiver_vnode, _}} ->
+      if server == sender, do: {sender_vnode, receiver_vnode}, else: nil
+    end)
+    |> Enum.reject(&is_nil/1)
+
+    Enum.reduce(sender_receiver_vnode_pairs, receiver_kv_store, fn {sender_vnode, receiver_vnode}, acc_kv_store ->
+      sender_vnode_kv_store = sender_kv_store
+      |> Enum.filter(fn {_, {_, _, {_, vnode}, _, _}} -> vnode == sender_vnode end)
+      
+      Enum.reduce(sender_vnode_kv_store, acc_kv_store, fn {key, sender_key_data}, acc_inner_kv_store ->
+        case Map.get(acc_inner_kv_store, key) do
+          nil ->
+            {v, sender_vector_clock, {s, sv}, _, sender_clock} = sender_key_data
+            updated_receiver_data = {v, sender_vector_clock, {s, sv}, receiver_vnode, sender_clock}
+            acc_inner_kv_store = Map.put(acc_inner_kv_store, key, updated_receiver_data)
+
+          receiver_key_data ->
+            {v, sender_vector_clock, {s, sv}, _, sender_clock} = sender_key_data
+            {_, receiver_vector_clock, {_, _}, _, receiver_clock} = receiver_key_data
+            if Dynamo.VectorClock.lessThanEqualTo(sender_vector_clock, receiver_vector_clock) do
+              # Receiver is more or equally updated so do nothing
+              acc_inner_kv_store
+            else
+              if Dynamo.VectorClock.greaterThan(sender_vector_clock, receiver_vector_clock) do
+                # Receiver can be less updated.
+                updated_receiver_data = {v, sender_vector_clock, {s, sv}, receiver_vnode, sender_clock}
+                acc_inner_kv_store = Map.put(acc_inner_kv_store, key, updated_receiver_data)
+              else 
+                # Reciver and Sender are unrelated. Compare clocks
+                if sender_clock > receiver_clock do 
+                  updated_receiver_data = {v, sender_vector_clock, {s, sv}, receiver_vnode, sender_clock}
+                  acc_inner_kv_store = Map.put(acc_inner_kv_store, key, updated_receiver_data)
+                else 
+                  # Do nothing
+                  acc_inner_kv_store
+                end
+              end
+            end
+        end
+      end)
+    end)
   end
 
   def server(state) do
@@ -285,7 +333,16 @@ defmodule Dynamo do
             end
           server(state)  
         end
-
+      :antientropy ->
+          other_nodes = List.delete(state.nodes, whoami())
+          select_node = Enum.random(other_nodes)
+          send(select_node, {:merkle_request, state.kv_store})
+          timer = Emulation.timer(50, :antientropy)
+          server(state)
+      {sender, {:merkle_request, sender_kv_store}} ->
+          receiver_kv_store = state.kv_store
+          updated_kv_store = syncronisation(sender, whoami(), sender_kv_store, receiver_kv_store)
+          server(%{state | kv_store: updated_kv_store})
       {sender, :state} ->
           send(sender,{whoami(), state})
           server(state) 
