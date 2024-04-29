@@ -139,31 +139,33 @@ defmodule Dynamo.ServerPutResponse do
     Put Request for Client
     """
     alias __MODULE__
-    @enforce_keys [:key, :status, :client, :seq]
+    @enforce_keys [:key, :value, :status, :client, :seq]
     defstruct(
         key: nil,
         client: nil,
         status: nil,
         seq: nil,
         context: nil,
-        vnodeIndex: nil
+        vnodeIndex: nil,
+        value: nil
     )
 
     @doc """
     Create a new Client Put Request.
     """
-    @spec new(non_neg_integer(), atom(), atom(), non_neg_integer()) ::
+    @spec new(non_neg_integer(), atom(), atom(), non_neg_integer(), non_neg_integer()) ::
             %ServerPutResponse{
                 key: non_neg_integer(),
                 status: atom(),
                 client: atom(),
                 seq: non_neg_integer()
             }
-    def new(key, client, status, seq) do
+    def new(key, value, client, status, seq) do
         %ServerPutResponse{
         key: key,
         client: client,
         status: status,
+        value: value,
         seq: seq,
         context: nil,
         vnodeIndex: nil

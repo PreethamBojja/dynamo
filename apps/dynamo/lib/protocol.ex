@@ -42,7 +42,15 @@ defmodule Dynamo do
     # Map from each vnode to keys stored 
     vnodeToKeys: nil,
     # Map from each server to all nodes status
-    status_of_nodes: nil
+    status_of_nodes: nil,
+    # Map of server request to their timer
+    requestTimerMap: nil,
+    # Map of seq to client request to their timer
+    clientRequestTimerMap: nil,
+    # Map of hinted handOff with vnode index
+    hintedHandedOffMap: nil,
+    # Simulated failure boolean
+    inFailedState: nil
   )
 
   # 
@@ -70,7 +78,11 @@ defmodule Dynamo do
       seq: -1,
       response_count: %{},
       responses: %{},
-      vnodeToKeys: %{}
+      vnodeToKeys: %{},
+      status_of_nodes: Enum.into(nodes, %{}, fn node -> {node, {"Failed", 0}} end),
+      requestTimerMap: %{},
+      clientRequestTimerMap: %{},
+      inFailedState: false
     }
   end
 
@@ -82,7 +94,8 @@ defmodule Dynamo do
   def make_server(state) do
     Ring.add_node(state.ring, whoami(), state.vnodes)
     timer = Emulation.timer(50, :antientropy)
-    timer = Emulation.timer(200, :gossip)
+    timer = Emulation.timer(10, :gossip)
+    state = %{state | status_of_nodes: Map.put(state.status_of_nodes, whoami(), {"Healthy", Emulation.now()})}
     server(%{state | node: whoami()})
   end
 
@@ -98,28 +111,44 @@ defmodule Dynamo do
     end
   end
   
-  def circular_traversal(list, start_index, count) do
+  def circular_traversal(list, start_index, count, unhealthy_nodes) do
     length = length(list)
     start_index = rem(start_index, length)
-    traverse_circular(list, start_index, count, MapSet.new(), [])
+    traverse_circular(list, start_index, count, unhealthy_nodes, MapSet.new(), [], MapSet.new(), [])
   end
   
-  defp traverse_circular(_list, _index, 0, distinct_items, preference_list) do
-    {MapSet.to_list(distinct_items), preference_list}
+  defp traverse_circular(_list, _index, 0, unhealthy_nodes, distinct_items, preference_list, distinct_skipped_items, skipped_items_list) do
+    {preference_list, skipped_items_list}
   end
   
-  defp traverse_circular(list, index, count, distinct_items, preference_list) do
+  defp traverse_circular(list, index, count, unhealthy_nodes, distinct_items, preference_list, distinct_skipped_items, skipped_items_list) do
     element = Enum.at(list, index)
   
     case MapSet.member?(distinct_items, element) do
       true ->
         next_index = rem(index + 1, length(list))
-        traverse_circular(list, next_index, count, distinct_items, preference_list)
+        traverse_circular(list, next_index, count, unhealthy_nodes, distinct_items, preference_list, distinct_skipped_items, skipped_items_list)
       false ->
-        preference_list = preference_list ++ [index]
-        next_index = rem(index + 1, length(list))
-        distinct_items = MapSet.put(distinct_items, element)
-        traverse_circular(list, next_index, count - 1, distinct_items, preference_list)
+        case MapSet.member?(unhealthy_nodes, element) do
+          true ->
+            case MapSet.member?(distinct_skipped_items, element) do
+              true ->
+                next_index = rem(index + 1, length(list))
+                traverse_circular(list, next_index, count, unhealthy_nodes, distinct_items, preference_list, distinct_skipped_items, skipped_items_list)
+
+              false ->
+                skipped_items_list = skipped_items_list ++ [index]
+                next_index = rem(index + 1, length(list))
+                distinct_items = MapSet.put(distinct_items, element)
+                traverse_circular(list, next_index, count, unhealthy_nodes, distinct_items, preference_list, distinct_skipped_items, skipped_items_list)
+            end
+
+          false ->
+            preference_list = preference_list ++ [index]
+            next_index = rem(index + 1, length(list))
+            distinct_items = MapSet.put(distinct_items, element)
+            traverse_circular(list, next_index, count - 1, unhealthy_nodes, distinct_items, preference_list, distinct_skipped_items, skipped_items_list)
+        end
     end
   end
   
@@ -129,7 +158,14 @@ defmodule Dynamo do
     {:ok, nodes} = Ring.get_nodes_with_replicas(ring)
     {hashList, nodeList} = Enum.unzip(Node.expand(nodes))
     start_index = find_start_index(hashList, Hash.of(key))
-    circular_traversal(nodeList, start_index, state.replication_factor)
+    unhealthy_nodes = state.status_of_nodes
+                      |> Enum.filter(fn {_node, {status, _timestamp}} -> status == "Failed" end)
+                      |> Enum.map(fn {node, _} -> node end)
+    unhealthy_nodes = MapSet.new(unhealthy_nodes)
+    {pref_list_indices, skip_list_indices} = circular_traversal(nodeList, start_index, state.replication_factor, unhealthy_nodes)
+    pref_list =  Enum.map(pref_list_indices, fn index -> Enum.at(nodeList, index) end)
+    skip_list =  Enum.map(skip_list_indices, fn index -> Enum.at(nodeList, index) end)
+    {pref_list, pref_list_indices, skip_list, skip_list_indices}
   end
 
   # Broadcast a message to all nodes in the configuration (excluding the sender.)
@@ -202,6 +238,10 @@ defmodule Dynamo do
     end)
   end
 
+  def makeHealthy(state, sender) do
+    %{state | status_of_nodes: Map.put(state.status_of_nodes, sender, {"Healthy", Emulation.now()})}
+  end
+
   def server(state) do
     receive do 
       {sender,
@@ -216,69 +256,91 @@ defmodule Dynamo do
        }} ->
 
         # IO.puts("Put request received at #{whoami()}")
-        
-        {preference_list, preference_list_indices} = get_preference_list(state,key)
-        start_index = Enum.at(preference_list_indices,0)
-        if not replication do 
-          if(Enum.at(preference_list,0) == whoami()) do
-            if context != nil do 
-              state = %{state | kv_store: Map.put(state.kv_store,key,{value, context,{whoami(), start_index}, start_index, Emulation.now()})}
+        if state.inFailedState == true do
+          server(state)
+        else
+          if not replication do 
+            # IO.inspect("Getting preference list")
+            {preference_list, preference_list_indices, skip_list, skip_list_indices} = get_preference_list(state,key)
+            # IO.inspect("Done preference list")
+            start_index = Enum.at(preference_list_indices,0)
+            if(Enum.at(preference_list,0) == whoami()) do
+              IO.inspect(preference_list)
+              IO.inspect(skip_list)
+              if context != nil do 
+                state = %{state | kv_store: Map.put(state.kv_store,key,{value, context,{whoami(), start_index}, start_index, Emulation.now()})}
+              end
+              state = %{state | kv_store: Dynamo.VectorClock.updateVectorClock(state.kv_store, key, value, whoami(), state.seq + 1, start_index)}
+              state = %{state | vnodeToKeys: Map.put(state.vnodeToKeys, start_index, Enum.uniq(Enum.concat(Map.get(state.vnodeToKeys, start_index,[]), [key])))}
+              t = Emulation.timer(500, {:clientPutRequestTimeOut, whoami(), client, key, value, state.seq+1})
+              state = %{state | clientRequestTimerMap: Map.put(state.clientRequestTimerMap, {whoami(), client, key, value, state.seq+1}, t)}
+              IO.puts("Put done at for key:#{key} and value:#{value} at seq:#{state.seq + 1} at #{whoami()}")
+              state = 
+                if state.write_quorum == 1 do
+                  requestTimer = Map.get(state.clientRequestTimerMap, {whoami(), client, key, value, state.seq + 1}, nil)
+                  Emulation.cancel_timer(requestTimer)
+                  state = %{state | clientRequestTimerMap: Map.delete(state.clientRequestTimerMap, {whoami(), key, value, state.seq + 1})}
+                  send(client, {:ok, key})
+                  state
+                else
+                  state
+                end 
+              preference_list_tuple = Enum.zip(preference_list, preference_list_indices)  
+              new_state = Enum.reduce(preference_list_tuple, state, fn {node, vnode_index}, acc_state ->
+                                              if node != whoami() do
+                                                t = Emulation.timer(20, {:requestTimeout, whoami(), node, key, state.seq + 1})
+                                                new_state = %{acc_state | 
+                                                  requestTimerMap: Map.put(acc_state.requestTimerMap, {whoami(), node, key, state.seq + 1}, t)
+                                                }
+                                                
+                                                send(node, %Dynamo.ServerPutRequest{
+                                                  key: key,
+                                                  value: value,
+                                                  client: client,
+                                                  replication: true,
+                                                  seq: state.seq + 1,
+                                                  context: Map.get(new_state.kv_store, key),
+                                                  vnodeIndex: vnode_index
+                                                })
+                                                
+                                                new_state
+                                              else
+                                                acc_state
+                                              end
+                                            end)
+  
+  
+              # IO.puts("Got into co-ordinator and started broadcast")
+              server(%{ new_state | seq: state.seq + 1})
+            else
+              send(Enum.at(preference_list,0), %Dynamo.ServerPutRequest{
+                key: key,
+                value: value,
+                client: client,
+                replication: false,
+                seq: nil,
+                context: context
+               })  
+              server(state)
             end
-            state = %{state | kv_store: Dynamo.VectorClock.updateVectorClock(state.kv_store, key, value, whoami(), state.seq + 1, start_index)}
-            state = %{state | vnodeToKeys: Map.put(state.vnodeToKeys, start_index, Enum.uniq(Enum.concat(Map.get(state.vnodeToKeys, start_index,[]), [key])))}   
-            IO.puts("Put done at for key:#{key} and value:#{value} at seq:#{state.seq + 1} at #{whoami()}")
-            IO.inspect(state.kv_store)
-            state = 
-              if state.write_quorum == 1 do
-                send(client, {:ok, key})
-                state
-              else
-                state
-              end 
-            Enum.zip(preference_list, preference_list_indices)
-                    |> Enum.map(fn {node, vnode_index} ->
-                      if node != whoami() do
-                        send(node, %Dynamo.ServerPutRequest{
-                          key: key,
-                          value: value,
-                          client: client,
-                          replication: true,
-                          seq: state.seq + 1,
-                          context: Map.get(state.kv_store, key),
-                          vnodeIndex: vnode_index
-                        })
-                      end
-                    end)
-
-            # IO.puts("Got into co-ordinator and started broadcast")
-            server(%{ state | seq: state.seq + 1})
           else
-            send(Enum.at(preference_list,0), %Dynamo.ServerPutRequest{
+            # IO.puts("Got into replication at #{whoami()}")
+            # LAST WRITE WINS
+            IO.puts("Put replicated at for key:#{key} and value:#{value} at seq:#{seq} at #{whoami()}")
+            new_context = case context do 
+                              {a, b, c, _, e} -> {a, b, c, vindex, e} 
+                              _ -> context end
+            state = %{state | kv_store: Map.put(state.kv_store, key, new_context)}
+            state = %{state | vnodeToKeys: Map.put(state.vnodeToKeys, vindex, Enum.uniq(Enum.concat(Map.get(state.vnodeToKeys, vindex,[]), [key])))}
+            send(sender, %Dynamo.ServerPutResponse{
               key: key,
               value: value,
+              status: :ok,
               client: client,
-              replication: false,
-              seq: nil,
-              context: context
-             })  
-            server(state)
+              seq: seq
+              }) 
+            server(%{state | seq: seq})
           end
-        else
-          # IO.puts("Got into replication at #{whoami()}")
-          # LAST WRITE WINS
-          IO.puts("Put replicated at for key:#{key} and value:#{value} at seq:#{seq} at #{whoami()}")
-          new_context = case context do 
-                            {a, b, c, _, e} -> {a, b, c, vindex, e} 
-                            _ -> context end
-          state = %{state | kv_store: Map.put(state.kv_store, key, new_context)}
-          state = %{state | vnodeToKeys: Map.put(state.vnodeToKeys, vindex, Enum.uniq(Enum.concat(Map.get(state.vnodeToKeys, vindex,[]), [key])))}
-          send(sender, %Dynamo.ServerPutResponse{
-            key: key,
-            status: :ok,
-            client: client,
-            seq: seq
-            }) 
-          server(%{state | seq: seq})
         end
       
       {sender,
@@ -291,45 +353,81 @@ defmodule Dynamo do
        }} ->
         
         # IO.puts("Get request received at #{whoami()}")
-        
-        {preference_list, start_index} = get_preference_list(state,key)
-        if not replication do 
-          if(Enum.at(preference_list,0) == whoami()) do
-            state = %{state | responses: Map.put(state.responses, state.seq + 1, [Map.get(state.kv_store,key)])}
-            #  IO.puts("Got into co-ordinator and started broadcast")
-            state = 
-              if state.read_quorum == 1 do
-                send(client, {key, Map.get(state.responses, state.seq + 1)})
-                state
-              else
-                state
-              end
-            bcast(preference_list, %Dynamo.ServerGetRequest{
-                  key: key,
-                  client: client,
-                  replication: true,
-                  seq: state.seq + 1
-                })
-            server(%{ state | seq: state.seq + 1})
-          else
-            send(Enum.at(preference_list,0), %Dynamo.ServerGetRequest{
-              key: key,
-              client: client,
-              replication: false,
-              seq: nil
-             })  
-            server(state)
-          end
+        if state.inFailedState == true do
+          server(state)
         else
-          # {value , vclock} = Map.get(state.kv_store, key)
-          send(sender, %Dynamo.ServerGetResponse{
-            key: key,
-            value:  Map.get(state.kv_store, key),
-            status: :ok,
-            client: client,
-            seq: seq
-            }) 
-          server(%{ state | seq: seq})
+          if not replication do 
+            # IO.inspect("Getting preference list")
+            {preference_list, preference_list_indices, skip_list, skip_list_indices} = get_preference_list(state,key)
+            # IO.inspect("Done preference list")
+            if(Enum.at(preference_list,0) == whoami()) do
+              IO.inspect(preference_list)
+              IO.inspect(skip_list)
+              value = 
+              if Map.get(state.kv_store,key,nil) == nil do
+                []
+              else
+                Map.get(state.kv_store,key,nil) 
+              end
+              state = %{state | responses: Map.put(state.responses, state.seq + 1, [value])}
+              t = Emulation.timer(500, {:clientGetRequestTimeOut, whoami(), client, key, state.seq+1})
+              state = %{state | clientRequestTimerMap: Map.put(state.clientRequestTimerMap, {whoami(), client, key, state.seq+1}, t)}
+              #  IO.puts("Got into co-ordinator and started broadcast")
+              state = 
+                if state.read_quorum == 1 do
+                  requestTimer = Map.get(state.clientRequestTimerMap, {whoami(), client, key, state.seq + 1}, nil)
+                  Emulation.cancel_timer(requestTimer)
+                  state = %{state | clientRequestTimerMap: Map.delete(state.clientRequestTimerMap, {whoami(), key, state.seq + 1})}
+                  send(client, {key, Map.get(state.responses, state.seq + 1)})
+                  state
+                else
+                  state
+                end
+              new_state = Enum.reduce(preference_list, state, fn node, acc_state ->
+                                              if node != whoami() do
+                                                t = Emulation.timer(20, {:requestTimeout, whoami(), node, key, state.seq + 1})
+                                                new_state = %{acc_state | 
+                                                  requestTimerMap: Map.put(acc_state.requestTimerMap, {whoami(), node, key, state.seq + 1}, t)
+                                                }
+                                                
+                                                send(node, %Dynamo.ServerGetRequest{
+                                                            key: key,
+                                                            client: client,
+                                                            replication: true,
+                                                            seq: state.seq + 1
+                                                          })
+                                                
+                                                new_state
+                                              else
+                                                acc_state
+                                              end
+                                            end)
+              server(%{ new_state | seq: state.seq + 1})
+            else
+              send(Enum.at(preference_list,0), %Dynamo.ServerGetRequest{
+                key: key,
+                client: client,
+                replication: false,
+                seq: nil
+              })  
+              server(state)
+            end
+          else
+            IO.puts("Get replicated at for key:#{key} at seq:#{seq} at #{whoami()}")
+            value = if Map.get(state.kv_store,key,nil) == nil do
+                []
+              else
+                Map.get(state.kv_store,key,nil)
+              end
+            send(sender, %Dynamo.ServerGetResponse{
+              key: key,
+              value:  value,
+              status: :ok,
+              client: client,
+              seq: seq
+              }) 
+            server(%{ state | seq: seq})
+          end
         end
 
       {sender,
@@ -337,23 +435,36 @@ defmodule Dynamo do
           key: key,
           status: status,
           client: client,
+          value: value,
           seq: seq,
           context: context
         }} ->
-          # IO.puts("Got into server put response at #{whoami()}")  
-          if status == :ok do
-            state = if Map.get(state.response_count, seq, nil) == nil do
-                      %{state | response_count: Map.put(state.response_count, seq, 1)}
-                    else
-                      count = Map.get(state.response_count, seq)
-                      %{state | response_count: Map.put(state.response_count, seq, count + 1)} 
-                    end 
-            if Map.get(state.response_count, seq, nil) == state.write_quorum - 1 do
-              send(client, {:ok, key})
-            end
-            server(state)  
-          end
+
+        if state.inFailedState == true do
           server(state)
+        else  
+          IO.puts("Got into server put response at #{whoami()} with seq: #{seq}")
+          makeHealthy(state, sender)
+          if status == :ok and Map.get(state.requestTimerMap, {whoami(), sender, key, seq}, nil) != nil do
+              requestTimer = Map.get(state.requestTimerMap, {whoami(), sender, key, seq}, nil)
+              Emulation.cancel_timer(requestTimer)
+              state = %{state | requestTimerMap: Map.delete(state.requestTimerMap, {whoami(), sender, key, seq})}
+              state = if Map.get(state.response_count, seq, nil) == nil do
+                        %{state | response_count: Map.put(state.response_count, seq, 1)}
+                      else
+                        count = Map.get(state.response_count, seq)
+                        %{state | response_count: Map.put(state.response_count, seq, count + 1)} 
+                      end 
+              if Map.get(state.response_count, seq, nil) == state.write_quorum - 1 do
+                requestTimer = Map.get(state.clientRequestTimerMap, {whoami(), client, key, value, seq}, nil)
+                Emulation.cancel_timer(Map.get(state.clientRequestTimerMap, {whoami(), client, key, value, seq}, nil))    
+                state = %{state | clientRequestTimerMap: Map.delete(state.clientRequestTimerMap, {whoami(), client, key, seq})}
+                send(client, {:ok, key})
+              end
+              server(state)  
+            end
+            server(state)
+        end
 
       {sender,
         %Dynamo.ServerGetResponse{
@@ -364,62 +475,167 @@ defmodule Dynamo do
           seq: seq,
           context: context
         }} ->
-        # IO.puts("Got into server get response at #{whoami()}")  
-        if status == :ok do
-          state = if Map.get(state.response_count, seq, nil) == nil do
-                    %{state | response_count: Map.put(state.response_count, seq, 1)}
-                  else
-                    count = Map.get(state.response_count, seq)
-                    %{state | response_count: Map.put(state.response_count, seq, count + 1)} 
-                  end 
-          responses = Map.get(state.responses, seq, []) ++ [value]
-          state = %{state | responses: Map.put(state.responses, seq, responses)}
           
-          state = 
-            if Map.get(state.response_count, seq, 0) == state.read_quorum - 1 do
-              reconciledResponses = Dynamo.VectorClock.syntaticReconcilationWithValues(Map.get(state.responses, seq))
-              state = %{state | responses: Map.put(state.responses, seq, reconciledResponses)}
-              send(client, {key, Map.get(state.responses, seq)})
-              state
-            else
-              state
+          if state.inFailedState == true do
+            server(state)
+          else
+            IO.puts("Got into server get response at #{whoami()} with seq: #{seq}")
+            makeHealthy(state, sender)
+            if status == :ok and Map.get(state.requestTimerMap, {whoami(), sender, key, seq}, nil) != nil do
+              requestTimer = Map.get(state.requestTimerMap, {whoami(), sender, key, seq}, nil)
+              Emulation.cancel_timer(requestTimer)
+              state = %{state | requestTimerMap: Map.delete(state.requestTimerMap, {whoami(), key, seq})}
+              state = if Map.get(state.response_count, seq, nil) == nil do
+                        %{state | response_count: Map.put(state.response_count, seq, 1)}
+                      else
+                        count = Map.get(state.response_count, seq)
+                        %{state | response_count: Map.put(state.response_count, seq, count + 1)} 
+                      end 
+
+              responses = 
+              if value == [] do 
+                Map.get(state.responses, seq, [])
+              else
+                Map.get(state.responses, seq, []) ++ [value]
+              end
+              state = %{state | responses: Map.put(state.responses, seq, responses)}
+              
+              state = 
+                if Map.get(state.response_count, seq, 0) == state.read_quorum - 1 do
+                  requestTimer = Map.get(state.clientRequestTimerMap, {whoami(), client, key, value, seq}, nil)
+                  if requestTimer!= nil do
+                    Emulation.cancel_timer(requestTimer)
+                  end
+                  state = %{state | clientRequestTimerMap: Map.delete(state.clientRequestTimerMap, {whoami(), client, key, value, seq})}
+                  reconciledResponses = Dynamo.VectorClock.syntaticReconcilationWithValues(Map.get(state.responses, seq))
+                  state = %{state | responses: Map.put(state.responses, seq, reconciledResponses)}
+                  send(client, {key, Map.get(state.responses, seq)})
+                  state
+                else
+                  state
+                end
+              server(state)  
             end
-          server(state)  
-        end
+            server(state)
+          end
+
+      {:requestTimeout, node, failed_node, key, seq} ->
+
+        IO.inspect("Request timed out for #{node} with #{failed_node} with key : #{key} for seq : #{seq} ")
+        state = %{state | requestTimerMap: Map.delete(state.requestTimerMap, {node, failed_node, key, seq})}
+        state = %{state | status_of_nodes: Map.put(state.status_of_nodes, failed_node, {"Failed", Emulation.now()})}
         server(state)
 
+      {:clientPutRequestTimeOut, node, client, key, value, seq} ->
+
+        IO.inspect("Client Request timed out for Put at #{node} with #{client} with key : #{key} and value : #{value}")
+        IO.inspect(Map.get(state.clientRequestTimerMap, {node, client, key, value, seq}))
+        state = %{state | clientRequestTimerMap: Map.delete(state.clientRequestTimerMap, {node, client, key, value, seq})}
+        server = Enum.random(state.nodes)
+        if state.inFailedState == true do
+          server(state)
+        else
+          send(server, %Dynamo.ServerPutRequest{
+            key: key,
+            value: value,
+            client: client,
+            replication: false,
+            seq: nil,
+            context: nil
+          })
+          server(state)
+        end
+      
+      {:clientGetRequestTimeOut, node, client, key, seq} ->
+
+        IO.inspect("Client Request timed out for Get at #{node} with #{client} with key : #{key}")
+        state = %{state | clientRequestTimerMap: Map.delete(state.clientRequestTimerMap, {node, client, key, seq})}
+        server = Enum.random(state.nodes)
+        if state.inFailedState == true do
+          server(state)
+        else
+          send(server, %Dynamo.ServerGetRequest {
+            key: key,
+            client: client,
+            replication: false,
+            seq: nil
+            })
+          server(state)
+        end
+
+
+      {sender, {:failNode, failTime}} ->
+        state = %{state | status_of_nodes: Map.put(state.status_of_nodes, whoami(), {"Failed", Emulation.now()})}
+        state = %{state | inFailedState: true}
+        t = Emulation.timer(failTime, :recover)
+        server(state)
+
+      :recover ->
+        state = %{state | status_of_nodes: Map.put(state.status_of_nodes, whoami(), {"Healthy", Emulation.now()})}
+        state = %{state | inFailedState: false}
+        server(state)  
+
+
       :antientropy ->
+        if state.inFailedState == true do
+          server(state)
+        else
           other_nodes = List.delete(state.nodes, whoami())
           select_node = Enum.random(other_nodes)
           send(select_node, {:merkle_request, state.kv_store})
           timer = Emulation.timer(50, :antientropy)
           server(state)
+        end
 
       {sender, {:merkle_request, sender_kv_store}} ->
+        if state.inFailedState == true do
+          server(state)
+        else
+          makeHealthy(state, sender)
           receiver_kv_store = state.kv_store
           updated_kv_store = syncronisation(sender, whoami(), sender_kv_store, receiver_kv_store)
           server(%{state | kv_store: updated_kv_store})
-        
+        end
+
       :gossip ->
-        other_nodes = List.delete(state.nodes, whoami())
-        select_node = Enum.random(other_nodes)
-        send(select_node, {:gossip_request, state.status_of_nodes})
-        timer = Emulation.timer(200, :gossip)
+        if state.inFailedState == true do
+          server(state)
+        else
+          other_nodes = List.delete(state.nodes, whoami())
+          select_node = Enum.random(other_nodes)
+          send(select_node, {:gossip_request, state.status_of_nodes})
+          timer = Emulation.timer(10, :gossip)
+          server(state)
+        end
 
       {sender, {:gossip_request, sender_nodes_status}} ->
-        receiver_nodes_status = state.status_of_nodes
-        updated_status_of_nodes = gossipExchange(sender, whoami(), sender_nodes_status, receiver_nodes_status)
-        send(sender, {:gossip_response, updated_status_of_nodes})
-        server(%{state | status_of_nodes: updated_status_of_nodes})
+        if state.inFailedState == true do
+          server(state)
+        else
+          makeHealthy(state, sender)
+          receiver_nodes_status = state.status_of_nodes
+          updated_status_of_nodes = gossipExchange(sender, whoami(), sender_nodes_status, receiver_nodes_status)
+          send(sender, {:gossip_response, updated_status_of_nodes})
+          server(%{state | status_of_nodes: updated_status_of_nodes})
+        end
       
-      {sender, {:gossip_request, sender_nodes_status}} ->
-        receiver_nodes_status = state.status_of_nodes
-        updated_status_of_nodes = gossipExchange(sender, whoami(), sender_nodes_status, receiver_nodes_status)
-        server(%{state | status_of_nodes: updated_status_of_nodes})
+      {sender, {:gossip_response, sender_nodes_status}} ->
+        if state.inFailedState == true do
+          server(state)
+        else
+          makeHealthy(state, sender)
+          receiver_nodes_status = state.status_of_nodes
+          updated_status_of_nodes = gossipExchange(sender, whoami(), sender_nodes_status, receiver_nodes_status)
+          server(%{state | status_of_nodes: updated_status_of_nodes})
+        end
 
       {sender, :state} ->
           send(sender,{whoami(), state})
           server(state) 
+
+      m ->
+        IO.inspect(m)
+        server(state)
     end     
   end
 end
@@ -488,7 +704,7 @@ defmodule Dynamo.Client do
           client: whoami(),
           replication: false,
           seq: nil,
-          context: nil
+          context: context
         })
         client(%{state | client: sender})
 
@@ -509,11 +725,15 @@ defmodule Dynamo.Client do
 
       {sender, {:ok, key}} ->
         # send(state.client, {:put, :ok, key})
+        IO.inspect("----------------------------------------")
         IO.inspect("Put done for client:#{whoami()} with key:#{key} ")
+        IO.inspect("----------------------------------------")
         client(state)
 
       {sender, {key, responses}} ->
+        IO.inspect("----------------------------------------")
         IO.inspect("Get done for client:#{whoami()} with key:#{key} ")
+        IO.inspect("----------------------------------------")
         clockList = Enum.map(responses, fn {_first, second, _third, _fourth, _fifth} -> second end)
         clientResponse = Enum.map(responses, fn {first, second, _third, _fourth, _fifth} -> {first, second} end)
         send(state.client, {:get, key, clientResponse})
@@ -660,6 +880,7 @@ defmodule Dynamo.VectorClock do
   end
 
   def syntaticReconcilationWithValues(divergedValues) do
+    IO.inspect(divergedValues)
     syntaticReconcilationWithValuesHelper(0, divergedValues, [])
   end
 
