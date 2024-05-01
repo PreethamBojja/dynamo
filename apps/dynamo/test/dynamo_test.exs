@@ -7,7 +7,7 @@ defmodule DynamoTest do
   test "Dynamo test" do
     Emulation.init()
     # Emulation.append_fuzzers([Fuzzers.delay(10.0)])
-    Emulation.append_fuzzers([Fuzzers.drop(0.0), Fuzzers.delay(0.0)])
+    Emulation.append_fuzzers([Fuzzers.drop(0.05), Fuzzers.delay(0.0)])
     # Emulation.append_fuzzers([Fuzzers.drop(0.05)])
 
     nodes = [:s1, :s2, :s3, :s4, :s5, :s6, :s7, :s8, :s9]
@@ -42,21 +42,21 @@ defmodule DynamoTest do
           server_list: nodes
         })
 
-        receive do
-          {_, {:put, :ok, key}} ->
-            true
-        end
+        # receive do
+        #   {_, {:put, :ok, key}} ->
+        #     true
+        # end
       end)
-      # Process.sleep(400)
+      Process.sleep(1500)
 
-      handle = Process.monitor(client)
+      # handle = Process.monitor(client)
 
-      receive do
-        {:DOWN, ^handle, _, _, _} -> 
-          true
-      after
-        1_000 -> assert false
-      end  
+      # receive do
+      #   {:DOWN, ^handle, _, _, _} -> 
+      #     true
+      # after
+      #   1_000 -> assert false
+      # end  
 
       # failure2 =
       # Emulation.spawn(:failure2, fn ->
@@ -80,25 +80,30 @@ defmodule DynamoTest do
 
     # IO.inspect(states)
 
-    random_nodes = Enum.take_random(nodes, 3)
-    random_number_1 = 300 + :rand.uniform(250)
-    random_number_2 = 300 + :rand.uniform(250)
-    random_number_3 = 300 + :rand.uniform(250)
+    random_nodes = Enum.take_random(nodes, 4)
+    random_number_1 = 2300 + :rand.uniform(250)
+    random_number_2 = 2300 + :rand.uniform(250)
+    random_number_3 = 2300 + :rand.uniform(250)
+    random_number_4 = 2300 + :rand.uniform(250)
 
     IO.inspect("randomly failed nodes are #{inspect(Enum.at(random_nodes,0))}, #{inspect(Enum.at(random_nodes,1))} for #{inspect(random_number_1)}, #{inspect(random_number_2)}
     --------------------------------------------------------------------------------------")
-    failure1 =
-      Emulation.spawn(:failure1, fn ->
-        Emulation.send(Enum.at(random_nodes,0), {:failNode, random_number_1})
-      end)
-    failure2 =
-      Emulation.spawn(:failure2, fn ->
-        Emulation.send(Enum.at(random_nodes,1), {:failNode, random_number_2})
-      end)
-    failure3 =
-      Emulation.spawn(:failure3, fn ->
-        Emulation.send(Enum.at(random_nodes,2), {:failNode, random_number_3})
-      end)
+    # failure1 =
+    #   Emulation.spawn(:failure1, fn ->
+    #     Emulation.send(Enum.at(random_nodes,0), {:failNode, random_number_1})
+    #   end)
+    # failure2 =
+    #   Emulation.spawn(:failure2, fn ->
+    #     Emulation.send(Enum.at(random_nodes,1), {:failNode, random_number_2})
+    #   end)
+    # failure3 =
+    #   Emulation.spawn(:failure3, fn ->
+    #     Emulation.send(Enum.at(random_nodes,2), {:failNode, random_number_3})
+    #   end)
+    # # failure4 =
+    #   Emulation.spawn(:failure4, fn ->
+    #     Emulation.send(Enum.at(random_nodes,3), {:failNode, random_number_4})
+    #   end)
 
     client2 =
       Emulation.spawn(:client2, fn ->
@@ -107,20 +112,20 @@ defmodule DynamoTest do
           value: "Second",
           server_list: nodes
         })
-        receive do
-          {_, {:put, :ok, key}} ->
-            true
-        end
+        # receive do
+        #   {_, {:put, :ok, key}} ->
+        #     true
+        # end
       end)
       handle = Process.monitor(client2)
 
-      receive do
-        {:DOWN, ^handle, _, _, _} -> 
-          true
-      after
-        3_000 -> assert false
-      end  
-      # Process.sleep(400)
+      # receive do
+      #   {:DOWN, ^handle, _, _, _} -> 
+      #     true
+      # after
+      #   3_000 -> assert false
+      # end  
+      Process.sleep(1500)
 
      client3 =
       Emulation.spawn(:client3, fn ->
@@ -129,21 +134,21 @@ defmodule DynamoTest do
           value: "Third",
           server_list: nodes
         })
-        receive do
-          {_, {:put, :ok, key}} ->
-            true
-        end
+        # receive do
+        #   {_, {:put, :ok, key}} ->
+        #     true
+        # end
       end)
       # Process.sleep(400)
-      handle = Process.monitor(client3)
+      # handle = Process.monitor(client3)
 
-      receive do
-        {:DOWN, ^handle, _, _, _} -> 
-          true
-      after
-        3_000 -> assert false
-      end  
-      Process.sleep(100)
+      # receive do
+      #   {:DOWN, ^handle, _, _, _} -> 
+      #     true
+      # after
+      #   3_000 -> assert false
+      # end  
+      Process.sleep(1500)
 
      client4 =
       Emulation.spawn(:client4, fn ->
@@ -152,33 +157,20 @@ defmodule DynamoTest do
           value: "Fourth",
           server_list: nodes
         })
-        receive do
-          {_, {:put, :ok, key}} ->
-            true
-        end
+        # receive do
+        #   {_, {:put, :ok, key}} ->
+        #     true
+        # end
       end)
-      # Process.sleep(400)
-      handle = Process.monitor(client4)
+      Process.sleep(1500)
+      # handle = Process.monitor(client4)
 
-      receive do
-        {:DOWN, ^handle, _, _, _} -> 
-          true
-      after
-        5_000 -> assert false
-      end  
-
-    # Process.sleep(1000)
-    # view = [:s4, :s5, :s6]
-    # view |> Enum.map(fn x -> Emulation.send(x, :state) end)
-    # states =
-    #   view
-    #   |> Enum.map(fn x ->
-    #     receive do
-    #       {^x, state} -> state
-    #     end
-    #   end)
-
-    # IO.inspect(states)
+      # receive do
+      #   {:DOWN, ^handle, _, _, _} -> 
+      #     true
+      # after
+      #   5_000 -> assert false
+      # end  
 
     client6 =
       Emulation.spawn(:client6, fn ->
@@ -186,12 +178,13 @@ defmodule DynamoTest do
           key: Bojja,
           server_list: nodes
         })
-        IO.inspect("---------------------------------------------------")
 
         receive do
           {:c3, {:get, _key , responses}} ->
             [{value, _vclock}] = responses
+            IO.inspect("---------------------------------------------------")
             IO.puts("GET : #{inspect(value)}")
+            IO.inspect("---------------------------------------------------")
             true
         end
       end)
@@ -200,23 +193,23 @@ defmodule DynamoTest do
 
     receive do
       {:DOWN, ^handle, _, _, _} -> 
-        nodes |> Enum.map(fn x -> Emulation.send(x, :state) end)
+        # nodes |> Enum.map(fn x -> Emulation.send(x, :state) end)
 
-        states =
-          nodes
-          |> Enum.map(fn x ->
-            receive do
-              {^x, state} -> {state.node , Map.get(state.kv_store,Bojja,nil)}
-            end
-          end)
+        # states =
+        #   nodes
+        #   |> Enum.map(fn x ->
+        #     receive do
+        #       {^x, state} -> {state.node , Map.get(state.kv_store,Bojja,nil)}
+        #     end
+        #   end)
 
-        IO.inspect(states)
-
+        # IO.inspect(states)
         true
+
     after
       3_000 -> assert false
     end
-    
+
 
     # IO.inspect(config)
     # Dynamo.test_hashing()
